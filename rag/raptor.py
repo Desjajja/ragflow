@@ -56,17 +56,34 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
         set_llm_cache(self._llm_model.llm_name, system, response, history, gen_conf)
         return response
 
-    @timeout(2)
     async def _embedding_encode(self, txt):
         response = get_embed_cache(self._embd_model.llm_name, txt)
         if response is not None:
             return response
-        embds, _ = await trio.to_thread.run_sync(lambda: self._embd_model.encode([txt]))
-        if len(embds) < 1 or len(embds[0]) < 1:
-            raise Exception("Embedding error: ")
-        embds = embds[0]
-        set_embed_cache(self._embd_model.llm_name, txt, embds)
-        return embds
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Use longer timeout for embedding operations
+                with trio.move_on_after(60) as cancel_scope:
+                    embds, _ = await trio.to_thread.run_sync(lambda: self._embd_model.encode([txt]))
+                
+                if cancel_scope.cancelled_caught:
+                    if attempt == max_retries - 1:
+                        raise TimeoutError("Embedding operation timed out after 60s")
+                    await trio.sleep(2 ** attempt)
+                    continue
+                    
+                if len(embds) < 1 or len(embds[0]) < 1:
+                    raise Exception("Embedding error: ")
+                embds = embds[0]
+                set_embed_cache(self._embd_model.llm_name, txt, embds)
+                return embds
+                
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise e
+                await trio.sleep(2 ** attempt)
 
     def _get_optimal_clusters(self, embeddings: np.ndarray, random_state: int):
         max_clusters = min(self._max_cluster, len(embeddings))
