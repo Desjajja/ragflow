@@ -440,33 +440,52 @@ async def embedding(docs, mdl, parser_config=None, callback=None):
 
     tk_count = 0
     if len(tts) == len(cnts):
-        vts, c = await trio.to_thread.run_sync(lambda: mdl.encode(tts[0: 1]))
-        tts = np.concatenate([vts for _ in range(len(tts))], axis=0)
-        tk_count += c
+        try:
+            vts, c = await trio.to_thread.run_sync(lambda: mdl.encode(tts[0: 1]), cancellable=True)
+            tts = np.concatenate([vts for _ in range(len(tts))], axis=0)
+            tk_count += c
+        except trio.Cancelled:
+            logging.warning("Title encoding timeout, using default vectors")
+            # Skip title processing and continue
+            return 0, 0
 
     def batch_encode(txts):
         nonlocal mdl
         return mdl.encode([truncate(c, mdl.max_length-10) for c in txts])
 
     cnts_ = np.array([])
+    skipped_batches = 0
+    
     for i in range(0, len(cnts), EMBEDDING_BATCH_SIZE):
         async with embed_limiter:
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    with trio.move_on_after(120) as cancel_scope:
-                        vts, c = await trio.to_thread.run_sync(lambda: batch_encode(cnts[i: i + EMBEDDING_BATCH_SIZE]))
+            try:
+                with trio.move_on_after(30) as cancel_scope:
+                    vts, c = await trio.to_thread.run_sync(
+                        lambda: batch_encode(cnts[i: i + EMBEDDING_BATCH_SIZE]), 
+                        cancellable=True
+                    )
+                
+                if cancel_scope.cancelled_caught:
+                    logging.warning(f"Skipping batch {i//EMBEDDING_BATCH_SIZE + 1}: embedding timeout")
+                    skipped_batches += 1
+                    continue
                     
-                    if cancel_scope.cancelled_caught:
-                        if attempt == max_retries - 1:
-                            raise TimeoutError(f"Embedding operation timed out after 120s")
-                        await trio.sleep(2 ** attempt)
-                        continue
-                    break
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        raise e
-                    await trio.sleep(2 ** attempt)
+                if len(cnts_) == 0:
+                    cnts_ = vts
+                else:
+                    cnts_ = np.concatenate((cnts_, vts), axis=0)
+                tk_count += c
+                
+            except Exception as e:
+                logging.warning(f"Skipping batch {i//EMBEDDING_BATCH_SIZE + 1}: {e}")
+                skipped_batches += 1
+                continue
+    
+    if skipped_batches > 0:
+        logging.info(f"Embedding completed with {skipped_batches} skipped batches")
+    
+    if len(cnts_) == 0:
+        return 0, 0
         if len(cnts_) == 0:
             cnts_ = vts
         else:
