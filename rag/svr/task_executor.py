@@ -444,7 +444,7 @@ async def embedding(docs, mdl, parser_config=None, callback=None):
         tts = np.concatenate([vts for _ in range(len(tts))], axis=0)
         tk_count += c
 
-    @timeout(5)
+    @timeout(30)
     def batch_encode(txts):
         nonlocal mdl
         return mdl.encode([truncate(c, mdl.max_length-10) for c in txts])
@@ -452,7 +452,15 @@ async def embedding(docs, mdl, parser_config=None, callback=None):
     cnts_ = np.array([])
     for i in range(0, len(cnts), EMBEDDING_BATCH_SIZE):
         async with embed_limiter:
-            vts, c = await trio.to_thread.run_sync(lambda: batch_encode(cnts[i: i + EMBEDDING_BATCH_SIZE]))
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    vts, c = await trio.to_thread.run_sync(lambda: batch_encode(cnts[i: i + EMBEDDING_BATCH_SIZE]))
+                    break
+                except TimeoutError as e:
+                    if attempt == max_retries - 1:
+                        raise e
+                    await trio.sleep(2 ** attempt)
         if len(cnts_) == 0:
             cnts_ = vts
         else:
