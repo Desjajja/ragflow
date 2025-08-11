@@ -444,7 +444,6 @@ async def embedding(docs, mdl, parser_config=None, callback=None):
         tts = np.concatenate([vts for _ in range(len(tts))], axis=0)
         tk_count += c
 
-    @timeout(30)
     def batch_encode(txts):
         nonlocal mdl
         return mdl.encode([truncate(c, mdl.max_length-10) for c in txts])
@@ -455,9 +454,16 @@ async def embedding(docs, mdl, parser_config=None, callback=None):
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    vts, c = await trio.to_thread.run_sync(lambda: batch_encode(cnts[i: i + EMBEDDING_BATCH_SIZE]))
+                    with trio.move_on_after(120) as cancel_scope:
+                        vts, c = await trio.to_thread.run_sync(lambda: batch_encode(cnts[i: i + EMBEDDING_BATCH_SIZE]))
+                    
+                    if cancel_scope.cancelled_caught:
+                        if attempt == max_retries - 1:
+                            raise TimeoutError(f"Embedding operation timed out after 120s")
+                        await trio.sleep(2 ** attempt)
+                        continue
                     break
-                except TimeoutError as e:
+                except Exception as e:
                     if attempt == max_retries - 1:
                         raise e
                     await trio.sleep(2 ** attempt)
