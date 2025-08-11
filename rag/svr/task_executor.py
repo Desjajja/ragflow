@@ -459,23 +459,22 @@ async def embedding(docs, mdl, parser_config=None, callback=None):
     for i in range(0, len(cnts), EMBEDDING_BATCH_SIZE):
         async with embed_limiter:
             try:
-                with trio.move_on_after(30) as cancel_scope:
-                    vts, c = await trio.to_thread.run_sync(
-                        lambda: batch_encode(cnts[i: i + EMBEDDING_BATCH_SIZE]), 
-                        cancellable=True
-                    )
+                # Direct call to avoid timeout wrapper
+                vts, c = await trio.to_thread.run_sync(
+                    lambda: mdl.encode([truncate(c, mdl.max_length-10) for c in cnts[i: i + EMBEDDING_BATCH_SIZE]]), 
+                    cancellable=True
+                )
                 
-                if cancel_scope.cancelled_caught:
-                    logging.warning(f"Skipping batch {i//EMBEDDING_BATCH_SIZE + 1}: embedding timeout")
-                    skipped_batches += 1
-                    continue
-                    
                 if len(cnts_) == 0:
                     cnts_ = vts
                 else:
                     cnts_ = np.concatenate((cnts_, vts), axis=0)
                 tk_count += c
                 
+            except trio.Cancelled:
+                logging.warning(f"Skipping batch {i//EMBEDDING_BATCH_SIZE + 1}: embedding timeout")
+                skipped_batches += 1
+                continue
             except Exception as e:
                 logging.warning(f"Skipping batch {i//EMBEDDING_BATCH_SIZE + 1}: {e}")
                 skipped_batches += 1
@@ -484,20 +483,15 @@ async def embedding(docs, mdl, parser_config=None, callback=None):
     if skipped_batches > 0:
         logging.info(f"Embedding completed with {skipped_batches} skipped batches")
     
-    if len(cnts_) == 0:
-        return 0, 0
-        if len(cnts_) == 0:
-            cnts_ = vts
-        else:
-            cnts_ = np.concatenate((cnts_, vts), axis=0)
-        tk_count += c
-        callback(prog=0.7 + 0.2 * (i + 1) / len(cnts), msg="")
     cnts = cnts_
-    filename_embd_weight = parser_config.get("filename_embd_weight", 0.1) # due to the db support none value
-    if not filename_embd_weight:
-        filename_embd_weight = 0.1
-    title_w = float(filename_embd_weight)
-    vects = (title_w * tts + (1 - title_w) *
+    if callback:
+        callback(prog=0.7 + 0.2 * (len(cnts) if cnts else 1), msg="")
+    
+    filename_embd_weight = parser_config.get("filename_embd_weight", 0.1)
+    if len(tts) == len(cnts) and len(cnts) > 0:
+        cnts = np.concatenate((cnts, tts * filename_embd_weight), axis=1)
+    
+    return tk_count, len(cnts[0]) if len(cnts) > 0 else 0
              cnts) if len(tts) == len(cnts) else cnts
 
     assert len(vects) == len(docs)
