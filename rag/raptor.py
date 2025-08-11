@@ -20,7 +20,6 @@ import numpy as np
 from sklearn.mixture import GaussianMixture
 import trio
 
-from api.utils.api_utils import timeout
 from graphrag.utils import (
     get_llm_cache,
     get_embed_cache,
@@ -42,19 +41,34 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
         self._prompt = prompt
         self._max_token = max_token
 
-    @timeout(60)
     async def _chat(self, system, history, gen_conf):
         response = get_llm_cache(self._llm_model.llm_name, system, history, gen_conf)
         if response:
             return response
-        response = await trio.to_thread.run_sync(
-            lambda: self._llm_model.chat(system, history, gen_conf)
-        )
-        response = re.sub(r"^.*</think>", "", response, flags=re.DOTALL)
-        if response.find("**ERROR**") >= 0:
-            raise Exception(response)
-        set_llm_cache(self._llm_model.llm_name, system, response, history, gen_conf)
-        return response
+        
+        try:
+            # Add timeout to prevent infinite generation
+            safe_gen_conf = gen_conf.copy()
+            safe_gen_conf.setdefault('max_tokens', 200)
+            safe_gen_conf.setdefault('temperature', 0.1)
+            
+            response = await trio.to_thread.run_sync(
+                lambda: self._llm_model.chat(system, history, safe_gen_conf),
+                cancellable=True
+            )
+            if isinstance(response, str):
+                response = re.sub(r"^.*</think>", "", response, flags=re.DOTALL)
+                if response.find("**ERROR**") >= 0:
+                    raise Exception(response)
+                if len(response.strip()) == 0:
+                    raise Exception("Empty response from model")
+            set_llm_cache(self._llm_model.llm_name, system, response, history, gen_conf)
+            return response
+        except trio.Cancelled:
+            raise TimeoutError("Model chat operation timed out")
+        except Exception as e:
+            logging.error(f"Model chat failed: {e}")
+            raise e
 
     async def _embedding_encode(self, txt):
         response = get_embed_cache(self._embd_model.llm_name, txt)
@@ -64,15 +78,16 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Use longer timeout for embedding operations
-                with trio.move_on_after(60) as cancel_scope:
-                    embds, _ = await trio.to_thread.run_sync(lambda: self._embd_model.encode([txt]))
+                # Use explicit timeout for embedding operations
+                response = await trio.to_thread.run_sync(
+                    lambda: self._embd_model.encode([txt]),
+                    cancellable=True
+                )
                 
-                if cancel_scope.cancelled_caught:
-                    if attempt == max_retries - 1:
-                        raise TimeoutError("Embedding operation timed out after 60s")
-                    await trio.sleep(2 ** attempt)
-                    continue
+                if response is None or len(response[0]) < 1:
+                    raise Exception("Empty embedding response")
+                    
+                embds, _ = response
                     
                 if len(embds) < 1 or len(embds[0]) < 1:
                     raise Exception("Embedding error: ")
@@ -103,37 +118,48 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
         layers = [(0, len(chunks))]
         start, end = 0, len(chunks)
 
-        @timeout(60)
         async def summarize(ck_idx: list[int]):
             nonlocal chunks
             texts = [chunks[i][0] for i in ck_idx]
+            # Respect user's max_token but add minimum bound to prevent stuck models
+            reasonable_max_token = max(25, self._max_token)
             len_per_chunk = int(
-                (self._llm_model.max_length - self._max_token) / len(texts)
+                (self._llm_model.max_length - reasonable_max_token) / len(texts)
             )
             cluster_content = "\n".join(
                 [truncate(t, max(1, len_per_chunk)) for t in texts]
             )
-            async with chat_limiter:
-                cnt = await self._chat(
-                    "You're a helpful assistant.",
-                    [
-                        {
-                            "role": "user",
-                            "content": self._prompt.format(
-                                cluster_content=cluster_content
-                            ),
-                        }
-                    ],
-                    {"max_tokens": self._max_token},
-                )
-                cnt = re.sub(
-                    "(······\n由于长度的原因，回答被截断了，要继续吗？|For the content length reason, it stopped, continue?)",
-                    "",
-                    cnt,
-                )
-                logging.debug(f"SUM: {cnt}")
-                embds = await self._embedding_encode(cnt)
-                chunks.append((cnt, embds))
+            
+            try:
+                async with chat_limiter:
+                    cnt = await self._chat(
+                        "You're a helpful assistant.",
+                        [
+                            {
+                                "role": "user",
+                                "content": self._prompt.format(
+                                    cluster_content=cluster_content
+                                ),
+                            }
+                        ],
+                        {"max_tokens": reasonable_max_token},
+                    )
+                    if cnt is None:
+                        raise Exception("Empty response from model")
+                    
+                    if isinstance(cnt, str):
+                        cnt = re.sub(
+                            r"(······\n由于长度的原因，回答被截断了，要继续吗？|For the content length reason, it stopped, continue?)",
+                            "",
+                            cnt,
+                        )
+                    logging.debug(f"SUM: {cnt}")
+                    embds = await self._embedding_encode(cnt)
+                    chunks.append((cnt, embds))
+            except (TimeoutError, Exception) as e:
+                logging.warning(f"RAPTOR summarization failed for cluster {ck_idx}: {e}")
+                # Skip this cluster and continue processing
+                return
 
         labels = []
         while end - start > 1:

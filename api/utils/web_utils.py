@@ -78,7 +78,7 @@ CONTENT_TYPE_MAP = {
 
 def html2pdf(
     source: str,
-    timeout: int = 2,
+    timeout: int = 30,
     install_driver: bool = True,
     print_options: dict = {},
 ):

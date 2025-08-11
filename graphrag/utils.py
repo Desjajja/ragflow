@@ -333,7 +333,6 @@ async def graph_node_to_chunk(kb_id, embd_mdl, ent_name, meta, chunks):
     chunks.append(chunk)
 
 
-@timeout(3, 3)
 def get_relation(tenant_id, kb_id, from_ent_name, to_ent_name, size=1):
     ents = from_ent_name
     if isinstance(ents, str):

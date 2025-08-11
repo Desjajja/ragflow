@@ -69,7 +69,7 @@ class MCPToolCallSession(ToolCallSession):
                 async with sse_client(url, headers) as stream:
                     async with ClientSession(*stream) as client_session:
                         try:
-                            await asyncio.wait_for(client_session.initialize(), timeout=5)
+                            await asyncio.wait_for(client_session.initialize(), timeout=30)
                             logging.info("client_session initialized successfully")
                             await self._process_mcp_tasks(client_session)
                         except asyncio.TimeoutError:
@@ -86,7 +86,7 @@ class MCPToolCallSession(ToolCallSession):
                 async with streamablehttp_client(url, headers) as (read_stream, write_stream, _):
                     async with ClientSession(read_stream, write_stream) as client_session:
                         try:
-                            await asyncio.wait_for(client_session.initialize(), timeout=5)
+                            await asyncio.wait_for(client_session.initialize(), timeout=30)
                             logging.info("client_session initialized successfully")
                             await self._process_mcp_tasks(client_session)
                         except asyncio.TimeoutError:
@@ -103,7 +103,7 @@ class MCPToolCallSession(ToolCallSession):
     async def _process_mcp_tasks(self, client_session: ClientSession | None, error_message: str | None = None) -> None:
         while not self._close:
             try:
-                mcp_task, arguments, result_queue = await asyncio.wait_for(self._queue.get(), timeout=1)
+                mcp_task, arguments, result_queue = await asyncio.wait_for(self._queue.get(), timeout=5)
             except asyncio.TimeoutError:
                 continue
 
@@ -194,7 +194,7 @@ class MCPToolCallSession(ToolCallSession):
         self._thread_pool.shutdown(wait=True)
         self.__class__._ALL_INSTANCES.discard(self)
 
-    def close_sync(self, timeout: float | int = 5) -> None:
+    def close_sync(self, timeout: float | int = 30) -> None:
         if not self._event_loop.is_running():
             logging.warning(f"Event loop already stopped for {self._mcp_server.id}")
             return
