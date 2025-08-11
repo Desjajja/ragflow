@@ -79,24 +79,50 @@ class GraphExtractor(Extractor):
         self._left_token_count = max(llm_invoker.max_length * 0.6, self._left_token_count)
 
     async def _process_single_content(self, chunk_key_dp: tuple[str, str], chunk_seq: int, num_chunks: int, out_results):
-        token_count = 0
         chunk_key = chunk_key_dp[0]
         content = chunk_key_dp[1]
         hint_prompt = self._entity_extract_prompt.format(
             **self._context_base, input_text="{input_text}"
         ).format(**self._context_base, input_text=content)
 
-        gen_conf = {}
-        async with chat_limiter:
-            final_result = await trio.to_thread.run_sync(lambda: self._chat(hint_prompt, [{"role": "user", "content": "Output:"}], gen_conf))
-        token_count += num_tokens_from_string(hint_prompt + final_result)
-        history = pack_user_ass_to_openai_messages("Output:", final_result, self._continue_prompt)
-        for now_glean_index in range(self._max_gleanings):
-            async with chat_limiter:
-                glean_result = await trio.to_thread.run_sync(lambda: self._chat(hint_prompt, history, gen_conf))
-            history.extend([{"role": "assistant", "content": glean_result}, {"role": "user", "content": self._continue_prompt}])
-            token_count += num_tokens_from_string("\n".join([m["content"] for m in history]) + hint_prompt + self._continue_prompt)
-            final_result += glean_result
+        try:
+            gen_conf = {"max_tokens": 1000, "temperature": 0.1}
+            
+            # Main extraction
+            with trio.move_on_after(120) as cancel_scope:
+                final_result = await trio.to_thread.run_sync(
+                    lambda: self._chat(hint_prompt, [{"role": "user", "content": "Output:"}], gen_conf),
+                    cancellable=True
+                )
+            
+            if cancel_scope.cancelled_caught:
+                logging.warning(f"KG extraction timeout for chunk {chunk_key}, skipping")
+                return
+                
+            # Continue with gleanings if successful
+            token_count = num_tokens_from_string(hint_prompt + final_result)
+            history = pack_user_ass_to_openai_messages("Output:", final_result, self._continue_prompt)
+            
+            for now_glean_index in range(self._max_gleanings):
+                with trio.move_on_after(60) as cancel_scope:
+                    glean_result = await trio.to_thread.run_sync(
+                        lambda: self._chat(hint_prompt, history, gen_conf),
+                        cancellable=True
+                    )
+                
+                if cancel_scope.cancelled_caught:
+                    logging.warning(f"KG gleaning timeout for chunk {chunk_key}, using partial results")
+                    break
+                    
+                history.extend([
+                    {"role": "assistant", "content": glean_result}, 
+                    {"role": "user", "content": self._continue_prompt}
+                ])
+                final_result += glean_result
+                
+        except Exception as e:
+            logging.warning(f"KG processing failed for chunk {chunk_key}: {e}, skipping")
+            return
             if now_glean_index == self._max_gleanings - 1:
                 break
 
